@@ -63,6 +63,117 @@ Base.metadata.create_all(bind=engine)
 latest_reading = {}
 last_update_time = 0
 
+# ── Standard tank dimensions (manufacturer spec table) ─────
+# Height "without lid" in mm, from the manufacturer datasheet - used
+# to ESTIMATE the sensor-to-bottom distance for a given tank capacity
+# without requiring the user to physically empty the tank first. This
+# is a starting default only; the live /calibrate-empty and
+# /calibrate-full actions always take precedence once performed, since
+# real measurement is more accurate than a manufacturer average.
+TANK_SPEC_TABLE = {
+    550:   1175,
+    750:   1180,
+    1000:  1470,
+    2000:  1688,
+    3000:  1740,
+    5000:  1810,
+    10000: 2840,
+}
+
+# Assumed clearance between the sensor's mounting point and the very
+# top of the tank (lid/manhole area) - the sensor cannot sit flush
+# with the rim, so the true empty-distance is slightly less than the
+# full tank height. This is a conservative estimate, refined by live
+# calibration.
+SENSOR_MOUNT_MARGIN_CM = 5.0
+
+
+def estimate_empty_distance_cm(capacity_liters: float) -> float:
+    """Interpolates/extrapolates expected tank height from the spec
+    table for a given capacity, and converts it to an estimated
+    sensor-to-bottom (empty) distance in cm."""
+    capacities = sorted(TANK_SPEC_TABLE.keys())
+
+    if capacity_liters <= capacities[0]:
+        height_mm = TANK_SPEC_TABLE[capacities[0]]
+    elif capacity_liters >= capacities[-1]:
+        height_mm = TANK_SPEC_TABLE[capacities[-1]]
+    else:
+        # Linear interpolation between the two nearest standard sizes
+        lower = max(c for c in capacities if c <= capacity_liters)
+        upper = min(c for c in capacities if c >= capacity_liters)
+        if lower == upper:
+            height_mm = TANK_SPEC_TABLE[lower]
+        else:
+            frac = (capacity_liters - lower) / (upper - lower)
+            height_mm = TANK_SPEC_TABLE[lower] + frac * (TANK_SPEC_TABLE[upper] - TANK_SPEC_TABLE[lower])
+
+    height_cm = height_mm / 10.0
+    return round(height_cm - SENSOR_MOUNT_MARGIN_CM, 1)
+
+
+# ── Device configuration (capacity + sensor physical limits) ──
+# Single source of truth: the app sets tank capacity here (not
+# directly on the device), and the ESP32 fetches it on boot and
+# periodically. Distance limits reflect the physical blind zone and
+# maximum range of the JSN-SR04T ultrasonic sensor (~22cm minimum,
+# ~400cm maximum) and are enforced by the device when calibrating,
+# so a user cannot calibrate a "Full" distance the sensor physically
+# cannot measure.
+device_config = {
+    "tank_capacity_liters": 650.0,
+    "min_distance_cm": 22.0,   # JSN-SR04T blind zone
+    "max_distance_cm": 400.0,  # JSN-SR04T max reliable range
+    "estimated_empty_distance_cm": estimate_empty_distance_cm(650.0),
+    "empty_distance_manually_calibrated": False,
+}
+
+class DeviceConfigRequest(BaseModel):
+    tank_capacity_liters: Optional[float] = None
+    min_distance_cm: Optional[float] = None
+    max_distance_cm: Optional[float] = None
+
+
+@app.post('/device-config')
+def set_device_config(cfg: DeviceConfigRequest):
+    """Called by the APP to update tank capacity (and, if needed,
+    advanced sensor limits). The ESP32 picks this up on its next
+    config fetch - it is never pushed directly, keeping the cloud
+    record as the single source of truth.
+
+    Whenever capacity changes, the estimated empty-distance is
+    recomputed from the manufacturer spec table. This estimate is
+    only ever used by the device if it has not yet been manually
+    calibrated - a real measurement always takes precedence."""
+    if cfg.tank_capacity_liters is not None:
+        device_config["tank_capacity_liters"] = cfg.tank_capacity_liters
+        device_config["estimated_empty_distance_cm"] = estimate_empty_distance_cm(cfg.tank_capacity_liters)
+    if cfg.min_distance_cm is not None:
+        device_config["min_distance_cm"] = cfg.min_distance_cm
+    if cfg.max_distance_cm is not None:
+        device_config["max_distance_cm"] = cfg.max_distance_cm
+    return {"status": "saved", "config": device_config}
+
+
+@app.get('/device-config')
+def get_device_config():
+    """Called by the ESP32 on boot and periodically to sync capacity,
+    sensor limits, and the manufacturer-spec-estimated empty distance.
+    If unreachable, the device falls back to its own last-known/
+    hardcoded defaults - this call is advisory, not a hard dependency,
+    consistent with the offline-first design."""
+    return device_config
+
+
+@app.post('/device-config/mark-calibrated')
+def mark_manually_calibrated():
+    """Called by the ESP32 once the user performs a real
+    /calibrate-empty reading, so the cloud stops advertising the
+    manufacturer-spec estimate as authoritative for this device."""
+    device_config["empty_distance_manually_calibrated"] = True
+    return {"status": "marked"}
+
+
 # ── Pending manual pump command (app -> device) ──────
 # Advisory only: the device applies its own "physical state wins"
 # rule and may reject this if stale or if a local safety fault is
