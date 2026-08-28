@@ -13,7 +13,6 @@ from datetime import datetime
 
 load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
-connection = psycopg2.connect(DATABASE_URL)
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
