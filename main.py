@@ -15,7 +15,6 @@ from datetime import datetime
 load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# ── App must be created FIRST ────────────────────────
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -24,11 +23,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Load prediction model on startup ─────────────────
 model = joblib.load('water_model.pkl')
 pf    = joblib.load('water_poly_features.pkl')
 
-# ── Database setup ────────────────────────────────────
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
@@ -43,12 +40,9 @@ class Reading(Base):
     ph_value = Column(Float)
     turbidity = Column(Float)
     pump_status = Column(Boolean)
-    # Reconciliation metadata: was this reading uploaded live, or
-    # recovered from the device's local buffer after an outage?
-    source = Column(String, default="live")          # "live" | "reconciled"
-    reconnect_event = Column(Integer, nullable=True)  # groups a batch together
+    source = Column(String, default="live")
+    reconnect_event = Column(Integer, nullable=True)
 
-# Logs each offline period, for evidence of offline-resilience testing
 class ReconciliationEvent(Base):
     __tablename__ = "reconciliation_events"
     id = Column(Integer, primary_key=True, index=True)
@@ -59,17 +53,9 @@ class ReconciliationEvent(Base):
 
 Base.metadata.create_all(bind=engine)
 
-# ── In-memory cache of the most recent reading ───────
 latest_reading = {}
 last_update_time = 0
 
-# ── Standard tank dimensions (manufacturer spec table) ─────
-# Height "without lid" in mm, from the manufacturer datasheet - used
-# to ESTIMATE the sensor-to-bottom distance for a given tank capacity
-# without requiring the user to physically empty the tank first. This
-# is a starting default only; the live /calibrate-empty and
-# /calibrate-full actions always take precedence once performed, since
-# real measurement is more accurate than a manufacturer average.
 TANK_SPEC_TABLE = {
     550:   1175,
     750:   1180,
@@ -80,11 +66,6 @@ TANK_SPEC_TABLE = {
     10000: 2840,
 }
 
-# Assumed clearance between the sensor's mounting point and the very
-# top of the tank (lid/manhole area) - the sensor cannot sit flush
-# with the rim, so the true empty-distance is slightly less than the
-# full tank height. This is a conservative estimate, refined by live
-# calibration.
 SENSOR_MOUNT_MARGIN_CM = 5.0
 
 
@@ -99,7 +80,6 @@ def estimate_empty_distance_cm(capacity_liters: float) -> float:
     elif capacity_liters >= capacities[-1]:
         height_mm = TANK_SPEC_TABLE[capacities[-1]]
     else:
-        # Linear interpolation between the two nearest standard sizes
         lower = max(c for c in capacities if c <= capacity_liters)
         upper = min(c for c in capacities if c >= capacity_liters)
         if lower == upper:
@@ -112,18 +92,10 @@ def estimate_empty_distance_cm(capacity_liters: float) -> float:
     return round(height_cm - SENSOR_MOUNT_MARGIN_CM, 1)
 
 
-# ── Device configuration (capacity + sensor physical limits) ──
-# Single source of truth: the app sets tank capacity here (not
-# directly on the device), and the ESP32 fetches it on boot and
-# periodically. Distance limits reflect the physical blind zone and
-# maximum range of the JSN-SR04T ultrasonic sensor (~22cm minimum,
-# ~400cm maximum) and are enforced by the device when calibrating,
-# so a user cannot calibrate a "Full" distance the sensor physically
-# cannot measure.
 device_config = {
     "tank_capacity_liters": 650.0,
-    "min_distance_cm": 22.0,   # JSN-SR04T blind zone
-    "max_distance_cm": 400.0,  # JSN-SR04T max reliable range
+    "min_distance_cm": 22.0,
+    "max_distance_cm": 400.0,
     "estimated_empty_distance_cm": estimate_empty_distance_cm(650.0),
     "empty_distance_manually_calibrated": False,
 }
@@ -174,13 +146,8 @@ def mark_manually_calibrated():
     return {"status": "marked"}
 
 
-# ── Pending manual pump command (app -> device) ──────
-# Advisory only: the device applies its own "physical state wins"
-# rule and may reject this if stale or if a local safety fault is
-# active. This is intentional - see firmware applyRemoteCommandIfValid().
 pending_command = {"has_command": False, "pump_on": False, "issued_at": 0}
 
-# ── Sensor reading model (ESP32 → backend) ───────────
 class SensorReading(BaseModel):
     tank_level_pct: float
     flow_rate: float
@@ -257,8 +224,6 @@ def sync_batch(batch: SyncBatchRequest):
     finally:
         db.close()
 
-    # Bring the in-memory "latest" cache up to date with the most
-    # recent reading recovered from the outage
     if batch.readings:
         latest_reading = batch.readings[-1].dict()
         last_update_time = time.time()
@@ -318,7 +283,7 @@ def poll_pump_command():
         "pump_on": pending_command["pump_on"],
         "issued_at_ms": int(pending_command["issued_at"] * 1000),
     }
-    pending_command = {"has_command": False, "pump_on": False, "issued_at": 0}  # consume once
+    pending_command = {"has_command": False, "pump_on": False, "issued_at": 0}
     return result
 
 
@@ -353,7 +318,6 @@ def get_history(limit: int = 100):
         "source": r.source,
     } for r in rows]
 
-# ── Prediction models ─────────────────────────────────
 class PredictRequest(BaseModel):
     day: int
     tank_level_pct: float

@@ -1,9 +1,3 @@
-"""
-Predictive model evaluation - generates the MAE/RMSE/MAPE comparison
-for Table 6.5 in Chapter 6 (Moving Average vs Linear vs Polynomial).
-
-Run this in the same folder as household_water_consumption.csv.
-"""
 import pandas as pd
 import numpy as np
 from sklearn.linear_model import LinearRegression
