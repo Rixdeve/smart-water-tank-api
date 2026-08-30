@@ -2,10 +2,11 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
-import joblib
 import numpy as np
 import time
 import os
+from collections import defaultdict
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, Column, Integer, Float, Boolean, DateTime, String
 from sqlalchemy.ext.declarative import declarative_base
@@ -22,9 +23,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-model = joblib.load('water_model.pkl')
-pf    = joblib.load('water_poly_features.pkl')
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine)
@@ -70,9 +68,6 @@ SENSOR_MOUNT_MARGIN_CM = 5.0
 
 
 def estimate_empty_distance_cm(capacity_liters: float) -> float:
-    """Interpolates/extrapolates expected tank height from the spec
-    table for a given capacity, and converts it to an estimated
-    sensor-to-bottom (empty) distance in cm."""
     capacities = sorted(TANK_SPEC_TABLE.keys())
 
     if capacity_liters <= capacities[0]:
@@ -108,15 +103,6 @@ class DeviceConfigRequest(BaseModel):
 
 @app.post('/device-config')
 def set_device_config(cfg: DeviceConfigRequest):
-    """Called by the APP to update tank capacity (and, if needed,
-    advanced sensor limits). The ESP32 picks this up on its next
-    config fetch - it is never pushed directly, keeping the cloud
-    record as the single source of truth.
-
-    Whenever capacity changes, the estimated empty-distance is
-    recomputed from the manufacturer spec table. This estimate is
-    only ever used by the device if it has not yet been manually
-    calibrated - a real measurement always takes precedence."""
     if cfg.tank_capacity_liters is not None:
         device_config["tank_capacity_liters"] = cfg.tank_capacity_liters
         device_config["estimated_empty_distance_cm"] = estimate_empty_distance_cm(cfg.tank_capacity_liters)
@@ -129,21 +115,28 @@ def set_device_config(cfg: DeviceConfigRequest):
 
 @app.get('/device-config')
 def get_device_config():
-    """Called by the ESP32 on boot and periodically to sync capacity,
-    sensor limits, and the manufacturer-spec-estimated empty distance.
-    If unreachable, the device falls back to its own last-known/
-    hardcoded defaults - this call is advisory, not a hard dependency,
-    consistent with the offline-first design."""
     return device_config
 
 
 @app.post('/device-config/mark-calibrated')
 def mark_manually_calibrated():
-    """Called by the ESP32 once the user performs a real
-    /calibrate-empty reading, so the cloud stops advertising the
-    manufacturer-spec estimate as authoritative for this device."""
     device_config["empty_distance_manually_calibrated"] = True
     return {"status": "marked"}
+
+
+auto_mode_state = {"auto_mode": True}
+
+class AutoModeRequest(BaseModel):
+    auto_mode: bool
+
+@app.post('/auto-mode')
+def set_auto_mode(req: AutoModeRequest):
+    auto_mode_state["auto_mode"] = req.auto_mode
+    return {"status": "saved", "auto_mode": auto_mode_state["auto_mode"]}
+
+@app.get('/auto-mode')
+def get_auto_mode():
+    return auto_mode_state
 
 
 pending_command = {"has_command": False, "pump_on": False, "issued_at": 0}
@@ -193,15 +186,6 @@ def receive_reading(reading: SensorReading):
 
 @app.post('/sync-batch')
 def sync_batch(batch: SyncBatchRequest):
-    """
-    Reconciliation endpoint. Called by the ESP32 immediately after it
-    regains connectivity, carrying every reading it buffered locally
-    while offline. This is the mechanism that resolves the split-brain
-    problem: rather than the cloud record simply having a silent gap
-    during an outage, the device's own local record - captured while
-    running independently on edge logic - is uploaded and preserved,
-    with the device's local timeline treated as authoritative.
-    """
     global latest_reading, last_update_time
 
     db = SessionLocal()
@@ -241,8 +225,6 @@ def sync_batch(batch: SyncBatchRequest):
 
 @app.get('/reconciliation-log')
 def get_reconciliation_log(limit: int = 50):
-    """Returns past offline/reconnect events - use this as evidence
-    of offline-resilience for the evaluation chapter."""
     db = SessionLocal()
     try:
         rows = db.query(ReconciliationEvent).order_by(
@@ -259,9 +241,6 @@ def get_reconciliation_log(limit: int = 50):
 
 @app.post('/pump-command')
 def issue_pump_command(cmd: PumpCommandRequest):
-    """Called by the APP to request a manual pump override. This only
-    queues the request - the device decides independently whether to
-    honour it, based on staleness and local safety state."""
     global pending_command
     pending_command = {
         "has_command": True,
@@ -273,7 +252,6 @@ def issue_pump_command(cmd: PumpCommandRequest):
 
 @app.get('/pump-command')
 def poll_pump_command():
-    """Called by the ESP32 to check for a pending manual command."""
     global pending_command
     if not pending_command["has_command"]:
         return {"has_command": False}
@@ -329,15 +307,39 @@ class PredictResponse(BaseModel):
     alert: bool
     recommendation: str
 
+COLD_START_FALLBACK_L = 651.0
+MOVING_AVERAGE_WINDOW_DAYS = 7
+
+
+def compute_moving_average_forecast():
+    db = SessionLocal()
+    try:
+        cutoff = datetime.utcnow() - timedelta(days=MOVING_AVERAGE_WINDOW_DAYS + 1)
+        rows = db.query(Reading).filter(Reading.timestamp >= cutoff).order_by(Reading.timestamp).all()
+    finally:
+        db.close()
+
+    if not rows:
+        return COLD_START_FALLBACK_L, 0
+
+    daily_totals = defaultdict(float)
+    for r in rows:
+        day_key = r.timestamp.date()
+        daily_totals[day_key] = max(daily_totals[day_key], r.total_litres or 0)
+
+    values = list(daily_totals.values())
+    if not values:
+        return COLD_START_FALLBACK_L, 0
+
+    return sum(values) / len(values), len(values)
+
 @app.get('/')
 def root():
     return {'status': 'Smart Water Tank API running'}
 
 @app.post('/predict', response_model=PredictResponse)
 def predict(req: PredictRequest):
-    X = np.array([[req.day]])
-    X_poly = pf.transform(X)
-    predicted = model.predict(X_poly)[0]
+    predicted, days_of_history = compute_moving_average_forecast()
     predicted = max(predicted, 0)
 
     current_liters = req.tank_capacity_liters * req.tank_level_pct
@@ -349,6 +351,8 @@ def predict(req: PredictRequest):
         if alert else
         f'Tank sufficient for {days_remaining:.1f} more days'
     )
+    if days_of_history < 3:
+        recommendation += ' (based on general average - building local history)'
 
     return PredictResponse(
         predicted_liters=round(predicted, 1),
